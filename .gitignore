@@ -1,0 +1,30 @@
+# Environment and secrets
+.env
+
+# GeoIP databases (downloaded at runtime)
+*.mmdb
+*.tar.gz
+
+# SQLite database (generated at runtime)
+flows.db
+flows.db-wal
+flows.db-shm
+
+# OAuth token persistence
+token_store.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/

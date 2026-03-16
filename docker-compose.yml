@@ -1,0 +1,50 @@
+services:
+
+  ingestor:
+    build: ./ingestor
+    container_name: netflow-ingestor
+    restart: unless-stopped
+    ports:
+      - "2055:2055/udp"
+    volumes:
+      - /mnt/netflow-data:/data
+    environment:
+      - TZ=${TZ:-America/Vancouver}
+
+  mcp-netflow:
+    build: ./mcp-server
+    container_name: netflow-mcp
+    restart: unless-stopped
+    volumes:
+      - /mnt/netflow-data:/data
+    expose:
+      - "3000"
+    environment:
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
+      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
+      - TOKEN_STORE_PATH=/data/token_store.json
+      - TZ=${TZ:-America/Vancouver}
+    depends_on:
+      - ingestor
+
+  geoipupdate:
+    image: ghcr.io/maxmind/geoipupdate:latest
+    container_name: netflow-geoipupdate
+    restart: unless-stopped
+    volumes:
+      - /mnt/netflow-data:/usr/share/GeoIP
+    environment:
+      - GEOIPUPDATE_ACCOUNT_ID=${GEOIPUPDATE_ACCOUNT_ID}
+      - GEOIPUPDATE_LICENSE_KEY=${GEOIPUPDATE_LICENSE_KEY}
+      - GEOIPUPDATE_EDITION_IDS=GeoLite2-ASN GeoLite2-Country
+      - GEOIPUPDATE_FREQUENCY=168
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: netflow-cloudflared
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    depends_on:
+      - mcp-netflow
