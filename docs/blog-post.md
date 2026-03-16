@@ -17,13 +17,13 @@ The system is four Docker containers on a single host, connected to the same LAN
 ```
 ┌──────────┐         ┌────────────────────────────────────────────────┐
 │ Meraki   │  UDP    │  Docker Host                                   │
-│ MX       │──2055──▶│  ┌───────────┐    SQLite    ┌──────────────┐  │
-│          │         │  │ ingestor  │───(WAL)────▶│ mcp-netflow  │  │
-└──────────┘         │  │           │    flows.db   │              │  │
-                     │  │ goflow2 + │              │ MCP Server   │  │
-                     │  │ GeoIP     │              │ OAuth 2.0    │  │
-                     │  └───────────┘              │ JSON-RPC     │  │
-                     │                              └──────┬───────┘  │
+│ MX       │──2055──▶│  ┌───────────┐    SQLite    ┌──────────────┐   │
+│          │         │  │ ingestor  │───(WAL)────▶ │ mcp-netflow  │   │
+└──────────┘         │  │           │    flows.db  │              │   │
+                     │  │ goflow2 + │              │ MCP Server   │   │
+                     │  │ GeoIP     │              │ OAuth 2.0    │   │
+                     │  └───────────┘              │ JSON-RPC     │   │
+                     │                             └───────┬──────┘   │
                      │  ┌─────────────┐                    │          │
                      │  │ geoipupdate │  weekly mmdb       │          │
                      │  └─────────────┘  updates           │          │
