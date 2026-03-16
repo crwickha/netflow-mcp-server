@@ -7,6 +7,9 @@ services:
     ports:
       - "2055:2055/udp"
     volumes:
+      # Host path is your shared data directory — change to any path on your host.
+      # All three app containers must point to the same host directory.
+      # Inside containers it is always mounted as /data (or /usr/share/GeoIP for geoipupdate).
       - /mnt/netflow-data:/data
     environment:
       - TZ=${TZ:-America/Vancouver}
