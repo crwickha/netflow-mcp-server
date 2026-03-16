@@ -5,10 +5,10 @@ A self-hosted NetFlow v9 collector that exposes network traffic analysis to [Cla
 ## Architecture
 
 ```
-Meraki MX ──UDP 2055──▶ [ingestor] ──SQLite WAL──▶ flows.db ◀── [mcp-netflow]
-                                                                      │
+Meraki MX --UDP 2055--> [ingestor] --SQLite WAL--> flows.db <-- [mcp-netflow]
+                                                                      |
                                                                 [cloudflared]
-                                                                      │
+                                                                      |
                                                                Claude.ai connector
 ```
 
