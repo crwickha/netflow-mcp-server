@@ -99,17 +99,19 @@ docker compose logs -f mcp-netflow   # MCP server ready
 
 ## MCP Tools
 
-Once connected, Claude has access to 10 analysis tools:
+Once connected, Claude has access to 12 analysis tools. Each completes in under 2 seconds thanks to tiered pre-aggregated summary tables.
 
 | Tool | What it does |
 |------|-------------|
-| `get_network_deep_dive` | Broad analysis: top talkers, destinations, countries, anomalies, rare ports |
-| `get_sample_flows` | Raw flow drill-down with filters (IP, port, protocol) |
-| `get_host_profile` | Behavioral profile for a single IP |
-| `detect_beaconing` | C2 beaconing detection via interval regularity analysis |
+| `get_traffic_overview` | High-level summary: totals, hourly timeline, top talkers, port/protocol breakdown |
+| `get_top_destinations` | Top external destinations with GeoIP, countries, east-west traffic, new destinations |
+| `get_anomaly_scan` | Anomaly detection: high destination counts, rare ports, off-hours activity, scanning detection |
+| `get_sample_flows` | Raw flow drill-down with filters (IP, port, protocol), max 48h |
+| `get_host_profile` | Behavioral profile for a single IP, max 7 days |
+| `detect_beaconing` | C2 beaconing detection via interval regularity analysis, max 48h |
 | `get_geoip_context` | Everything known about an external IP |
-| `get_time_window` | Traffic summary for an exact timestamp range |
-| `get_baseline_delta` | Compare current vs prior period, spot changes |
+| `get_time_window` | Traffic summary for an exact timestamp range, max 48h window |
+| `get_baseline_delta` | Compare current vs prior period, spot changes, max 7 days |
 | `get_baseline` | Statistical baseline profile (avg, stddev, p95) |
 | `check_baseline_deviation` | Compare last 24h against baseline using z-scores |
 | `get_collector_health` | Collector status, flow counts, DB size |
@@ -117,6 +119,7 @@ Once connected, Claude has access to 10 analysis tools:
 ### Example prompts
 
 - *"Give me an overview of my network traffic for the last 7 days"*
+- *"Scan my network for any security anomalies"*
 - *"Check for any C2 beaconing patterns in the last 24 hours"*
 - *"Is anything abnormal right now compared to baseline?"*
 - *"Profile the behavior of 192.168.1.100 over the last week"*
