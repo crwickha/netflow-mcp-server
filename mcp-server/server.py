@@ -21,7 +21,7 @@ logger = logging.getLogger("netflow-mcp")
 # ============================================================================
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
@@ -43,14 +43,44 @@ def rows_to_list(rows):
 
 TOOLS = [
     {
-        "name": "get_network_deep_dive",
+        "name": "get_traffic_overview",
         "description": (
-            "Return a comprehensive structured analysis of network flow data "
-            "for the last N days. Includes: traffic totals, hourly volume timeline, "
-            "top talkers, top external destinations with GeoIP, protocol breakdown, "
-            "internal east-west traffic, statistical anomaly candidates, rare ports, "
-            "and newly seen destinations vs baseline. Use this for broad analysis "
-            "and security investigations. Max 14 days."
+            "Return a high-level traffic summary for the last N days: total bytes, "
+            "packets, flows, unique hosts, hourly volume timeline, top 20 talkers "
+            "by bytes, and protocol/port breakdown. This is the fastest broad view "
+            "of network activity. Start here for any network analysis. Max 14 days."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Number of days to analyze (max 14)", "default": 7}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_top_destinations",
+        "description": (
+            "Return top external destinations with GeoIP context, traffic by country, "
+            "internal east-west traffic pairs, and newly seen destinations vs baseline. "
+            "Use after get_traffic_overview to understand WHERE traffic is going. Max 14 days."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Number of days to analyze (max 14)", "default": 7}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "get_anomaly_scan",
+        "description": (
+            "Scan for anomalies: hosts with unusually high destination counts, "
+            "rare external ports (non-standard), off-hours activity (midnight-5am UTC), "
+            "and suspicious flow patterns (high flow count with low bytes per flow, "
+            "which indicates port scanning or reconnaissance). Use after "
+            "get_traffic_overview for security investigations. Max 14 days."
         ),
         "inputSchema": {
             "type": "object",
@@ -76,7 +106,7 @@ TOOLS = [
                 "dst_ip": {"type": "string", "description": "Destination IP to filter by"},
                 "dst_port": {"type": "integer", "description": "Destination port to filter by"},
                 "proto": {"type": "string", "description": "Protocol to filter by (TCP, UDP, etc.)"},
-                "hours_back": {"type": "integer", "description": "How many hours back to search", "default": 24},
+                "hours_back": {"type": "integer", "description": "How many hours back to search (max 48)", "default": 24},
                 "limit": {"type": "integer", "description": "Max flows to return (max 500)", "default": 200},
                 "order_by": {"type": "string", "description": "Order by: bytes, packets, or ts", "default": "bytes"}
             },
@@ -96,7 +126,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "ip": {"type": "string", "description": "IP address to profile"},
-                "days": {"type": "integer", "description": "Number of days to analyze", "default": 7}
+                "days": {"type": "integer", "description": "Number of days to analyze (max 7)", "default": 7}
             },
             "required": ["ip"]
         }
@@ -113,7 +143,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "hours_back": {"type": "integer", "description": "Hours to analyze", "default": 24},
+                "hours_back": {"type": "integer", "description": "Hours to analyze (max 48)", "default": 24},
                 "min_occurrences": {"type": "integer", "description": "Minimum connection count to flag", "default": 6}
             },
             "required": []
@@ -163,7 +193,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "days": {"type": "integer", "description": "Number of days for each comparison period", "default": 7}
+                "days": {"type": "integer", "description": "Number of days for each comparison period (max 7)", "default": 7}
             },
             "required": []
         }
@@ -239,162 +269,217 @@ TOOLS = [
 # TOOL IMPLEMENTATIONS
 # ============================================================================
 
-def get_network_deep_dive(days=7):
+def get_traffic_overview(days=7):
     days = min(days, 14)
     start, end = ts_range(days)
+    start_day = (start // 86400) * 86400
     conn = db()
 
+    # Totals from daily_summary (~70k rows, near-instant)
     totals = dict(conn.execute("""
-        SELECT COUNT(*) as total_flows,
+        SELECT SUM(flow_count) as total_flows,
                COUNT(DISTINCT src_addr) as unique_internal_hosts,
-               COUNT(DISTINCT dst_addr) as unique_destinations,
-               SUM(bytes) as total_bytes,
-               SUM(packets) as total_packets
-        FROM flows WHERE ts BETWEEN ? AND ? AND src_is_private = 1
-    """, (start, end)).fetchone())
+               SUM(total_bytes) as total_bytes,
+               SUM(total_packets) as total_packets
+        FROM daily_summary WHERE day_ts >= ?
+    """, (start_day,)).fetchone())
 
-    hourly = rows_to_list(conn.execute("""
-        SELECT (ts/3600)*3600 as hour_ts,
-               SUM(bytes) as bytes, SUM(packets) as packets, COUNT(*) as flows
-        FROM flows WHERE ts BETWEEN ? AND ?
-        GROUP BY hour_ts ORDER BY hour_ts
-    """, (start, end)).fetchall())
-
+    # Top talkers from daily_summary
     top_talkers = rows_to_list(conn.execute("""
         SELECT src_addr,
-               SUM(bytes) as bytes_out,
-               SUM(packets) as packets_out,
-               COUNT(*) as flow_count,
-               COUNT(DISTINCT dst_addr) as unique_destinations,
-               COUNT(DISTINCT dst_port) as unique_ports_used
-        FROM flows WHERE ts BETWEEN ? AND ? AND src_is_private = 1
+               SUM(total_bytes) as bytes_out,
+               SUM(total_packets) as packets_out,
+               SUM(flow_count) as flow_count,
+               SUM(unique_dsts) as unique_destinations,
+               SUM(unique_ports) as unique_ports_used
+        FROM daily_summary WHERE day_ts >= ?
         GROUP BY src_addr ORDER BY bytes_out DESC LIMIT 20
-    """, (start, end)).fetchall())
+    """, (start_day,)).fetchall())
 
-    top_external = rows_to_list(conn.execute("""
-        SELECT dst_addr, dst_country, dst_org,
-               SUM(bytes) as bytes,
-               COUNT(*) as flows,
-               COUNT(DISTINCT src_addr) as internal_hosts_count
-        FROM flows WHERE ts BETWEEN ? AND ? AND dst_is_private = 0
-        GROUP BY dst_addr ORDER BY bytes DESC LIMIT 30
-    """, (start, end)).fetchall())
-
-    countries = rows_to_list(conn.execute("""
-        SELECT dst_country, SUM(bytes) as bytes, COUNT(*) as flows
-        FROM flows WHERE ts BETWEEN ? AND ? AND dst_is_private = 0
-        GROUP BY dst_country ORDER BY bytes DESC LIMIT 20
-    """, (start, end)).fetchall())
-
+    # Port/protocol breakdown from daily_port_summary
     protocols = rows_to_list(conn.execute("""
         SELECT dst_port, proto,
-               SUM(bytes) as bytes, COUNT(*) as flows,
-               COUNT(DISTINCT src_addr) as host_count
-        FROM flows WHERE ts BETWEEN ? AND ?
+               SUM(total_bytes) as bytes, SUM(flow_count) as flows,
+               SUM(unique_sources) as host_count
+        FROM daily_port_summary WHERE day_ts >= ?
         GROUP BY dst_port, proto ORDER BY bytes DESC LIMIT 25
-    """, (start, end)).fetchall())
+    """, (start_day,)).fetchall())
 
-    east_west = rows_to_list(conn.execute("""
-        SELECT src_addr, dst_addr,
-               SUM(bytes) as bytes, COUNT(*) as flows
-        FROM flows WHERE ts BETWEEN ? AND ?
-          AND src_is_private = 1 AND dst_is_private = 1
-        GROUP BY src_addr, dst_addr ORDER BY bytes DESC LIMIT 20
-    """, (start, end)).fetchall())
-
-    avg_row = conn.execute("""
-        SELECT AVG(cnt) as avg_dsts FROM (
-            SELECT src_addr, COUNT(DISTINCT dst_addr) as cnt
-            FROM flows WHERE ts BETWEEN ? AND ? AND src_is_private = 1
-            GROUP BY src_addr
-        )
-    """, (start, end)).fetchone()
-    avg_dsts = avg_row["avg_dsts"] or 1
-
-    anomaly_high_dsts = rows_to_list(conn.execute("""
-        SELECT src_addr,
-               COUNT(DISTINCT dst_addr) as unique_dsts,
-               COUNT(DISTINCT dst_port) as unique_ports,
-               SUM(bytes) as total_bytes
-        FROM flows WHERE ts BETWEEN ? AND ? AND src_is_private = 1
-        GROUP BY src_addr
-        HAVING unique_dsts > ? ORDER BY unique_dsts DESC LIMIT 10
-    """, (start, end, avg_dsts * 3)).fetchall())
-
-    COMMON_PORTS = (80, 443, 53, 123, 67, 68, 22, 25, 587, 993, 995, 143, 110,
-                    3389, 5222, 8080, 8443, 2055, 6343)
-    placeholders = ",".join("?" * len(COMMON_PORTS))
-    rare_ports = rows_to_list(conn.execute(f"""
-        SELECT dst_port, proto, dst_country,
-               COUNT(*) as flows,
-               GROUP_CONCAT(DISTINCT src_addr) as src_hosts,
-               SUM(bytes) as bytes
-        FROM flows WHERE ts BETWEEN ? AND ?
-          AND dst_port NOT IN ({placeholders})
-          AND dst_is_private = 0
-          AND dst_port IS NOT NULL AND dst_port > 0
-        GROUP BY dst_port ORDER BY flows DESC LIMIT 15
-    """, (start, end, *COMMON_PORTS)).fetchall())
-
-    new_dsts = rows_to_list(conn.execute("""
-        SELECT f.dst_addr, f.dst_country, f.dst_org,
-               MIN(f.ts) as first_seen,
-               COUNT(*) as flows, SUM(f.bytes) as bytes
-        FROM flows f
-        LEFT JOIN known_destinations kd ON f.dst_addr = kd.dst_addr
-        WHERE f.ts BETWEEN ? AND ?
-          AND f.dst_is_private = 0
-          AND (kd.first_seen IS NULL OR kd.first_seen >= ?)
-        GROUP BY f.dst_addr ORDER BY first_seen DESC LIMIT 20
-    """, (start, end, start)).fetchall())
-
-    off_hours = rows_to_list(conn.execute("""
-        SELECT src_addr,
-               SUM(bytes) as bytes, COUNT(*) as flows,
-               COUNT(DISTINCT dst_addr) as unique_dsts
-        FROM flows WHERE ts BETWEEN ? AND ?
-          AND src_is_private = 1
-          AND CAST(strftime('%H', ts, 'unixepoch') AS INTEGER) BETWEEN 0 AND 5
-        GROUP BY src_addr ORDER BY bytes DESC LIMIT 10
-    """, (start, end)).fetchall())
+    # Hourly volume still needs hourly_summary (but it's a simple GROUP BY on indexed hour_ts)
+    start_hour = (start // 3600) * 3600
+    hourly = rows_to_list(conn.execute("""
+        SELECT hour_ts,
+               SUM(total_bytes) as bytes, SUM(total_packets) as packets,
+               SUM(flow_count) as flows
+        FROM hourly_summary WHERE hour_ts >= ?
+        GROUP BY hour_ts ORDER BY hour_ts
+    """, (start_hour,)).fetchall())
 
     conn.close()
 
-    result = {
+    return json.dumps({
         "analysis_period_days": days,
         "period_start_utc": datetime.fromtimestamp(start, timezone.utc).isoformat(),
         "period_end_utc": datetime.fromtimestamp(end, timezone.utc).isoformat(),
         "totals": totals,
         "hourly_volume": hourly,
         "top_talkers": top_talkers,
+        "port_protocol_breakdown": protocols,
+    }, default=str)
+
+
+def get_top_destinations(days=7):
+    days = min(days, 14)
+    start, end = ts_range(days)
+    start_day = (start // 86400) * 86400
+    conn = db()
+
+    # Top external destinations from daily_dst_summary
+    top_external = rows_to_list(conn.execute("""
+        SELECT dst_addr, dst_country, dst_org,
+               SUM(total_bytes) as bytes,
+               SUM(flow_count) as flows,
+               SUM(unique_sources) as internal_hosts_count
+        FROM daily_dst_summary WHERE day_ts >= ? AND dst_is_private = 0
+        GROUP BY dst_addr ORDER BY bytes DESC LIMIT 30
+    """, (start_day,)).fetchall())
+
+    # Countries from daily_country_summary (~1k rows total)
+    countries = rows_to_list(conn.execute("""
+        SELECT dst_country, SUM(total_bytes) as bytes, SUM(flow_count) as flows
+        FROM daily_country_summary WHERE day_ts >= ?
+        GROUP BY dst_country ORDER BY bytes DESC LIMIT 20
+    """, (start_day,)).fetchall())
+
+    # East-west from daily_dst_summary
+    east_west = rows_to_list(conn.execute("""
+        SELECT dst_addr,
+               SUM(total_bytes) as bytes, SUM(flow_count) as flows,
+               SUM(unique_sources) as source_count
+        FROM daily_dst_summary WHERE day_ts >= ? AND dst_is_private = 1
+        GROUP BY dst_addr ORDER BY bytes DESC LIMIT 20
+    """, (start_day,)).fetchall())
+
+    # Newly seen destinations (needs known_destinations table)
+    new_dsts = rows_to_list(conn.execute("""
+        SELECT d.dst_addr, d.dst_country, d.dst_org,
+               SUM(d.total_bytes) as bytes, SUM(d.flow_count) as flows
+        FROM daily_dst_summary d
+        LEFT JOIN known_destinations kd ON d.dst_addr = kd.dst_addr
+        WHERE d.day_ts >= ?
+          AND d.dst_is_private = 0
+          AND (kd.first_seen IS NULL OR kd.first_seen >= ?)
+        GROUP BY d.dst_addr ORDER BY bytes DESC LIMIT 20
+    """, (start_day, start)).fetchall())
+
+    conn.close()
+
+    return json.dumps({
+        "analysis_period_days": days,
+        "period_start_utc": datetime.fromtimestamp(start, timezone.utc).isoformat(),
+        "period_end_utc": datetime.fromtimestamp(end, timezone.utc).isoformat(),
         "top_external_destinations": top_external,
         "traffic_by_country": countries,
-        "port_protocol_breakdown": protocols,
         "internal_east_west_traffic": east_west,
+        "newly_seen_destinations": new_dsts,
+    }, default=str)
+
+
+def get_anomaly_scan(days=7):
+    days = min(days, 14)
+    start, end = ts_range(days)
+    start_day = (start // 86400) * 86400
+    conn = db()
+
+    # Average unique destinations per host from daily_summary
+    avg_row = conn.execute("""
+        SELECT AVG(total_dsts) as avg_dsts FROM (
+            SELECT src_addr, SUM(unique_dsts) as total_dsts
+            FROM daily_summary WHERE day_ts >= ?
+            GROUP BY src_addr
+        )
+    """, (start_day,)).fetchone()
+    avg_dsts = avg_row["avg_dsts"] or 1
+
+    # Hosts with unusually high destination counts
+    anomaly_high_dsts = rows_to_list(conn.execute("""
+        SELECT src_addr,
+               SUM(unique_dsts) as unique_dsts,
+               SUM(unique_ports) as unique_ports,
+               SUM(total_bytes) as total_bytes
+        FROM daily_summary WHERE day_ts >= ?
+        GROUP BY src_addr
+        HAVING unique_dsts > ? ORDER BY unique_dsts DESC LIMIT 10
+    """, (start_day, avg_dsts * 3)).fetchall())
+
+    # Rare ports from daily_port_summary
+    COMMON_PORTS = (80, 443, 53, 123, 67, 68, 22, 25, 587, 993, 995, 143, 110,
+                    3389, 5222, 8080, 8443, 2055, 6343)
+    placeholders = ",".join("?" * len(COMMON_PORTS))
+    rare_ports = rows_to_list(conn.execute(f"""
+        SELECT dst_port, proto,
+               SUM(flow_count) as flows,
+               SUM(unique_sources) as host_count,
+               SUM(total_bytes) as bytes
+        FROM daily_port_summary WHERE day_ts >= ?
+          AND dst_port NOT IN ({placeholders})
+          AND dst_is_private = 0
+          AND dst_port > 0
+        GROUP BY dst_port, proto ORDER BY flows DESC LIMIT 15
+    """, (start_day, *COMMON_PORTS)).fetchall())
+
+    # Off-hours activity (midnight-5am UTC) from hourly_summary
+    start_hour = (start // 3600) * 3600
+    off_hours = rows_to_list(conn.execute("""
+        SELECT src_addr,
+               SUM(total_bytes) as bytes, SUM(flow_count) as flows,
+               COUNT(DISTINCT dst_addr) as unique_dsts
+        FROM hourly_summary WHERE hour_ts >= ?
+          AND (hour_ts % 86400) / 3600 BETWEEN 0 AND 5
+        GROUP BY src_addr ORDER BY bytes DESC LIMIT 10
+    """, (start_hour,)).fetchall())
+
+    # Suspicious flow patterns: internal hosts with high flow count but very low
+    # bytes-per-flow, plus high port diversity relative to destinations.
+    # Catches port scanning, SYN sweeps, and slow-and-low reconnaissance.
+    suspicious_flow_ratio = rows_to_list(conn.execute("""
+        SELECT src_addr,
+               SUM(flow_count) as total_flows,
+               SUM(total_bytes) as total_bytes,
+               ROUND(CAST(SUM(total_bytes) AS REAL) / MAX(SUM(flow_count), 1), 0) as avg_bytes_per_flow,
+               SUM(unique_dsts) as unique_dsts,
+               SUM(unique_ports) as unique_ports,
+               ROUND(CAST(SUM(unique_ports) AS REAL) / MAX(SUM(unique_dsts), 1), 1) as ports_per_dst
+        FROM daily_summary WHERE day_ts >= ? AND dst_is_private = 0
+        GROUP BY src_addr
+        HAVING total_flows > 1000 AND avg_bytes_per_flow < 500
+        ORDER BY total_flows DESC LIMIT 10
+    """, (start_day,)).fetchall())
+
+    conn.close()
+
+    return json.dumps({
+        "analysis_period_days": days,
+        "period_start_utc": datetime.fromtimestamp(start, timezone.utc).isoformat(),
+        "period_end_utc": datetime.fromtimestamp(end, timezone.utc).isoformat(),
         "anomaly_candidates": {
             "high_unique_destinations": anomaly_high_dsts,
             "network_avg_unique_destinations_per_host": round(avg_dsts, 1),
         },
         "rare_external_ports": rare_ports,
-        "newly_seen_destinations": new_dsts,
         "off_hours_activity_0000_0500": off_hours,
-        "available_followup_tools": [
-            "get_sample_flows(host, dst_port, hours_back, limit)",
-            "get_host_profile(ip)",
-            "get_geoip_context(ip)",
-            "get_time_window(start_ts, end_ts)",
-            "get_baseline_delta(days)",
-            "get_baseline(period, dimension)",
-            "check_baseline_deviation(period)",
-            "detect_beaconing(min_regularity_score)",
-        ]
-    }
-    return json.dumps(result, default=str)
+        "suspicious_flow_patterns": {
+            "description": "Hosts with high flow count but very low bytes per flow — indicates port scanning, SYN sweeps, or slow reconnaissance",
+            "threshold": "over 1000 flows with under 500 bytes per flow average",
+            "hosts": suspicious_flow_ratio,
+        },
+    }, default=str)
 
 
 def get_sample_flows(host=None, dst_ip=None, dst_port=None, proto=None,
                      hours_back=24, limit=200, order_by="bytes"):
     limit = min(limit, 500)
+    hours_back = min(hours_back, 48)
     start = int(time.time()) - (hours_back * 3600)
     conditions = ["ts >= ?"]
     params = [start]
@@ -438,38 +523,45 @@ def get_sample_flows(host=None, dst_ip=None, dst_port=None, proto=None,
 
 
 def get_host_profile(ip, days=7):
+    days = min(days, 7)
     start, end = ts_range(days)
+    start_day = (start // 86400) * 86400
+    start_hour = (start // 3600) * 3600
     conn = db()
 
+    # Outbound connections from daily_dst_summary via hourly_summary (filtered by src_addr + indexed)
     outbound = rows_to_list(conn.execute("""
         SELECT dst_addr, dst_port, proto, dst_country, dst_org,
-               SUM(bytes) as bytes, COUNT(*) as flows,
-               MIN(ts) as first_seen, MAX(ts) as last_seen
-        FROM flows WHERE src_addr = ? AND ts BETWEEN ? AND ?
+               SUM(total_bytes) as bytes, SUM(flow_count) as flows,
+               MIN(hour_ts) as first_seen, MAX(hour_ts) as last_seen
+        FROM hourly_summary WHERE src_addr = ? AND hour_ts >= ?
         GROUP BY dst_addr, dst_port, proto ORDER BY bytes DESC LIMIT 50
-    """, (ip, start, end)).fetchall())
+    """, (ip, start_hour)).fetchall())
 
+    # Inbound — use daily_dst_summary (the target IP is the dst_addr there)
     inbound = rows_to_list(conn.execute("""
-        SELECT src_addr, src_port, proto,
-               SUM(bytes) as bytes, COUNT(*) as flows
-        FROM flows WHERE dst_addr = ? AND ts BETWEEN ? AND ?
-        GROUP BY src_addr, src_port, proto ORDER BY bytes DESC LIMIT 20
-    """, (ip, start, end)).fetchall())
+        SELECT src_addr, dst_port, proto,
+               SUM(total_bytes) as bytes, SUM(flow_count) as flows
+        FROM hourly_summary WHERE dst_addr = ? AND hour_ts >= ?
+        GROUP BY src_addr, dst_port, proto ORDER BY bytes DESC LIMIT 20
+    """, (ip, start_hour)).fetchall())
 
+    # Hourly activity from hourly_summary (indexed on src_addr, hour_ts)
     hourly = rows_to_list(conn.execute("""
-        SELECT (ts/3600)*3600 as hour_ts,
-               SUM(bytes) as bytes, COUNT(*) as flows
-        FROM flows WHERE src_addr = ? AND ts BETWEEN ? AND ?
+        SELECT hour_ts,
+               SUM(total_bytes) as bytes, SUM(flow_count) as flows
+        FROM hourly_summary WHERE src_addr = ? AND hour_ts >= ?
         GROUP BY hour_ts ORDER BY hour_ts
-    """, (ip, start, end)).fetchall())
+    """, (ip, start_hour)).fetchall())
 
+    # Totals from daily_summary
     totals = dict(conn.execute("""
-        SELECT SUM(bytes) as total_bytes_out,
-               COUNT(*) as total_flows_out,
-               COUNT(DISTINCT dst_addr) as unique_destinations,
-               COUNT(DISTINCT dst_port) as unique_ports
-        FROM flows WHERE src_addr = ? AND ts BETWEEN ? AND ?
-    """, (ip, start, end)).fetchone())
+        SELECT SUM(total_bytes) as total_bytes_out,
+               SUM(flow_count) as total_flows_out,
+               SUM(unique_dsts) as unique_destinations,
+               SUM(unique_ports) as unique_ports
+        FROM daily_summary WHERE src_addr = ? AND day_ts >= ?
+    """, (ip, start_day)).fetchone())
 
     conn.close()
 
@@ -483,21 +575,25 @@ def get_host_profile(ip, days=7):
 
 
 def detect_beaconing(hours_back=24, min_occurrences=6):
+    hours_back = min(hours_back, 48)
     start = int(time.time()) - (hours_back * 3600)
+    start_hour = (start // 3600) * 3600
     conn = db()
 
+    # Use hourly_summary to find candidates with high flow counts to same dest
+    # Then only hit raw flows for the top candidates to get actual timestamps
     candidates = rows_to_list(conn.execute("""
         SELECT src_addr, dst_addr, dst_port, dst_country, dst_org,
-               COUNT(*) as occurrence_count,
-               MIN(ts) as first_seen, MAX(ts) as last_seen,
-               AVG(bytes) as avg_bytes_per_flow
-        FROM flows
-        WHERE ts >= ? AND dst_is_private = 0 AND src_is_private = 1
+               SUM(flow_count) as occurrence_count,
+               MIN(hour_ts) as first_seen, MAX(hour_ts) as last_seen
+        FROM hourly_summary
+        WHERE hour_ts >= ? AND dst_is_private = 0
         GROUP BY src_addr, dst_addr, dst_port
         HAVING occurrence_count >= ?
-        ORDER BY occurrence_count DESC LIMIT 50
-    """, (start, min_occurrences)).fetchall())
+        ORDER BY occurrence_count DESC LIMIT 30
+    """, (start_hour, min_occurrences)).fetchall())
 
+    # For the top 30 candidates, get timestamps from raw flows
     results = []
     for c in candidates:
         timestamps = [r[0] for r in conn.execute("""
@@ -516,33 +612,36 @@ def detect_beaconing(hours_back=24, min_occurrences=6):
         cv = (stddev / avg_interval) if avg_interval > 0 else 999
 
         results.append({
-            **c,
+            **{k: v for k, v in c.items()},
+            "occurrence_count": len(timestamps),
             "avg_interval_seconds": round(avg_interval, 1),
             "interval_stddev_seconds": round(stddev, 1),
             "regularity_coefficient": round(cv, 3),
             "suspicion": "HIGH" if cv < 0.15 else "MEDIUM" if cv < 0.35 else "LOW"
         })
 
-    results.sort(key=lambda x: x["regularity_coefficient"])
     conn.close()
+    results.sort(key=lambda x: x["regularity_coefficient"])
     return json.dumps({"hours_analyzed": hours_back,
                         "beaconing_candidates": results[:20]}, default=str)
 
 
 def get_geoip_context(ip):
     conn = db()
+
+    # Use hourly_summary instead of raw flows — dst_addr is indexed
     meta = dict(conn.execute("""
         SELECT dst_country, dst_org,
-               SUM(bytes) as total_bytes,
-               COUNT(*) as total_flows,
+               SUM(total_bytes) as total_bytes,
+               SUM(flow_count) as total_flows,
                COUNT(DISTINCT src_addr) as internal_hosts,
-               MIN(ts) as first_seen, MAX(ts) as last_seen
-        FROM flows WHERE dst_addr = ?
+               MIN(hour_ts) as first_seen, MAX(hour_ts) as last_seen
+        FROM hourly_summary WHERE dst_addr = ?
     """, (ip,)).fetchone())
 
     hosts = rows_to_list(conn.execute("""
-        SELECT src_addr, dst_port, SUM(bytes) as bytes, COUNT(*) as flows
-        FROM flows WHERE dst_addr = ?
+        SELECT src_addr, dst_port, SUM(total_bytes) as bytes, SUM(flow_count) as flows
+        FROM hourly_summary WHERE dst_addr = ?
         GROUP BY src_addr, dst_port ORDER BY bytes DESC LIMIT 20
     """, (ip,)).fetchall())
 
@@ -556,21 +655,28 @@ def get_geoip_context(ip):
 
 
 def get_time_window(start_ts, end_ts):
+    # Cap window to 48 hours max
+    max_window = 48 * 3600
+    if end_ts - start_ts > max_window:
+        start_ts = end_ts - max_window
+    start_hour = (start_ts // 3600) * 3600
     conn = db()
 
+    # Summary from hourly_summary
+    summary = dict(conn.execute("""
+        SELECT SUM(flow_count) as flows, SUM(total_bytes) as bytes,
+               COUNT(DISTINCT src_addr) as src_hosts,
+               COUNT(DISTINCT dst_addr) as dst_hosts
+        FROM hourly_summary WHERE hour_ts BETWEEN ? AND ?
+    """, (start_hour, end_ts)).fetchone())
+
+    # Top flows — still need raw flows for individual flow detail, but time-bounded
     top = rows_to_list(conn.execute("""
         SELECT src_addr, dst_addr, dst_port, proto, dst_country,
                bytes, packets, ts
         FROM flows WHERE ts BETWEEN ? AND ?
         ORDER BY bytes DESC LIMIT 100
     """, (start_ts, end_ts)).fetchall())
-
-    summary = dict(conn.execute("""
-        SELECT COUNT(*) as flows, SUM(bytes) as bytes,
-               COUNT(DISTINCT src_addr) as src_hosts,
-               COUNT(DISTINCT dst_addr) as dst_hosts
-        FROM flows WHERE ts BETWEEN ? AND ?
-    """, (start_ts, end_ts)).fetchone())
 
     conn.close()
 
@@ -583,24 +689,27 @@ def get_time_window(start_ts, end_ts):
 
 
 def get_baseline_delta(days=7):
+    days = min(days, 7)
     now = int(time.time())
     current_start = now - (days * 86400)
     prior_start = current_start - (days * 86400)
+    current_start_day = (current_start // 86400) * 86400
+    prior_start_day = (prior_start // 86400) * 86400
     conn = db()
 
     current = {r["src_addr"]: r for r in rows_to_list(conn.execute("""
-        SELECT src_addr, SUM(bytes) as bytes, COUNT(*) as flows,
-               COUNT(DISTINCT dst_addr) as unique_dsts
-        FROM flows WHERE ts BETWEEN ? AND ? AND src_is_private = 1
+        SELECT src_addr, SUM(total_bytes) as bytes, SUM(flow_count) as flows,
+               SUM(unique_dsts) as unique_dsts
+        FROM daily_summary WHERE day_ts >= ?
         GROUP BY src_addr
-    """, (current_start, now)).fetchall())}
+    """, (current_start_day,)).fetchall())}
 
     prior = {r["src_addr"]: r for r in rows_to_list(conn.execute("""
-        SELECT src_addr, SUM(bytes) as bytes, COUNT(*) as flows,
-               COUNT(DISTINCT dst_addr) as unique_dsts
-        FROM flows WHERE ts BETWEEN ? AND ? AND src_is_private = 1
+        SELECT src_addr, SUM(total_bytes) as bytes, SUM(flow_count) as flows,
+               SUM(unique_dsts) as unique_dsts
+        FROM daily_summary WHERE day_ts BETWEEN ? AND ?
         GROUP BY src_addr
-    """, (prior_start, current_start)).fetchall())}
+    """, (prior_start_day, current_start_day)).fetchall())}
 
     conn.close()
 
@@ -700,38 +809,39 @@ def check_baseline_deviation(period="7d"):
     for r in baseline_rows:
         baselines[(r["dimension"], r["key"])] = dict(r)
 
-    # Get last 24h actuals
+    # Get last 24h actuals from daily_summary tables (fast, ~70k rows)
     now = int(time.time())
     start_24h = now - 86400
+    start_24h_day = (start_24h // 86400) * 86400
 
     # Network total
     net_actual = conn.execute("""
-        SELECT SUM(bytes) as bytes, COUNT(*) as flows
-        FROM flows WHERE ts >= ? AND src_is_private = 1
-    """, (start_24h,)).fetchone()
+        SELECT SUM(total_bytes) as bytes, SUM(flow_count) as flows
+        FROM daily_summary WHERE day_ts >= ?
+    """, (start_24h_day,)).fetchone()
 
     # Per host
     host_actual = {r["src_addr"]: dict(r) for r in rows_to_list(conn.execute("""
-        SELECT src_addr, SUM(bytes) as bytes, COUNT(*) as flows,
-               COUNT(DISTINCT dst_addr) as unique_dsts
-        FROM flows WHERE ts >= ? AND src_is_private = 1
+        SELECT src_addr, SUM(total_bytes) as bytes, SUM(flow_count) as flows,
+               SUM(unique_dsts) as unique_dsts
+        FROM daily_summary WHERE day_ts >= ?
         GROUP BY src_addr
-    """, (start_24h,)).fetchall())}
+    """, (start_24h_day,)).fetchall())}
 
     # Per port
     port_actual = {str(r["dst_port"]): dict(r) for r in rows_to_list(conn.execute("""
-        SELECT dst_port, SUM(bytes) as bytes, COUNT(*) as flows
-        FROM flows WHERE ts >= ? AND dst_port IS NOT NULL
+        SELECT dst_port, SUM(total_bytes) as bytes, SUM(flow_count) as flows
+        FROM daily_port_summary WHERE day_ts >= ? AND dst_port IS NOT NULL
         GROUP BY dst_port
-    """, (start_24h,)).fetchall())}
+    """, (start_24h_day,)).fetchall())}
 
     # Per country
     country_actual = {r["dst_country"]: dict(r) for r in rows_to_list(conn.execute("""
-        SELECT dst_country, SUM(bytes) as bytes, COUNT(*) as flows
-        FROM flows WHERE ts >= ? AND dst_is_private = 0
+        SELECT dst_country, SUM(total_bytes) as bytes, SUM(flow_count) as flows
+        FROM daily_country_summary WHERE day_ts >= ?
           AND dst_country IS NOT NULL
         GROUP BY dst_country
-    """, (start_24h,)).fetchall())}
+    """, (start_24h_day,)).fetchall())}
 
     conn.close()
 
@@ -844,7 +954,8 @@ def check_baseline_deviation(period="7d"):
 
 def get_collector_health():
     conn = db()
-    total = conn.execute("SELECT COUNT(*) as c FROM flows").fetchone()["c"]
+    # Use max(rowid) as a fast approximation of total rows instead of COUNT(*)
+    max_id = conn.execute("SELECT MAX(rowid) FROM flows").fetchone()[0] or 0
     oldest = conn.execute("SELECT MIN(ts) FROM flows").fetchone()[0]
     newest = conn.execute("SELECT MAX(ts) FROM flows").fetchone()[0]
     recent = conn.execute(
@@ -852,7 +963,7 @@ def get_collector_health():
         (int(time.time()) - 300,)
     ).fetchone()["c"]
     exporters = rows_to_list(conn.execute(
-        "SELECT DISTINCT sampler_addr FROM flows WHERE sampler_addr != ''"
+        "SELECT DISTINCT sampler_addr FROM flows WHERE sampler_addr != '' LIMIT 20"
     ).fetchall())
     conn.close()
 
@@ -860,7 +971,7 @@ def get_collector_health():
 
     return json.dumps({
         "status": "ok" if recent > 0 else "warning: no flows in last 5 minutes",
-        "total_flows_in_db": total,
+        "total_flows_in_db_approx": max_id,
         "oldest_flow_utc": datetime.fromtimestamp(oldest or 0, timezone.utc).isoformat(),
         "newest_flow_utc": datetime.fromtimestamp(newest or 0, timezone.utc).isoformat(),
         "flows_last_5_minutes": recent,
@@ -874,7 +985,9 @@ def get_collector_health():
 # ============================================================================
 
 TOOL_MAP = {
-    "get_network_deep_dive": get_network_deep_dive,
+    "get_traffic_overview": get_traffic_overview,
+    "get_top_destinations": get_top_destinations,
+    "get_anomaly_scan": get_anomaly_scan,
     "get_sample_flows": get_sample_flows,
     "get_host_profile": get_host_profile,
     "detect_beaconing": detect_beaconing,

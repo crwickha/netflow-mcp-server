@@ -96,6 +96,11 @@ def init_db(conn):
         CREATE INDEX IF NOT EXISTS idx_dst_port    ON flows (dst_port);
         CREATE INDEX IF NOT EXISTS idx_dst_country ON flows (dst_country);
         CREATE INDEX IF NOT EXISTS idx_private     ON flows (dst_is_private);
+        CREATE INDEX IF NOT EXISTS idx_ts_src_private ON flows (ts, src_is_private);
+        CREATE INDEX IF NOT EXISTS idx_ts_dst_private ON flows (ts, dst_is_private);
+        CREATE INDEX IF NOT EXISTS idx_src_addr_ts    ON flows (src_addr, ts);
+        CREATE INDEX IF NOT EXISTS idx_dst_addr_ts    ON flows (dst_addr, ts);
+        CREATE INDEX IF NOT EXISTS idx_ts_dst_port    ON flows (ts, dst_port);
 
         CREATE TABLE IF NOT EXISTS hourly_summary (
             hour_ts         INTEGER NOT NULL,
@@ -113,6 +118,9 @@ def init_db(conn):
         );
         CREATE INDEX IF NOT EXISTS idx_hsummary_hour ON hourly_summary (hour_ts);
         CREATE INDEX IF NOT EXISTS idx_hsummary_src  ON hourly_summary (src_addr);
+        CREATE INDEX IF NOT EXISTS idx_hsummary_hour_src ON hourly_summary (hour_ts, src_addr);
+        CREATE INDEX IF NOT EXISTS idx_hsummary_hour_dst ON hourly_summary (hour_ts, dst_addr);
+        CREATE INDEX IF NOT EXISTS idx_hsummary_hour_private ON hourly_summary (hour_ts, dst_is_private);
 
         CREATE TABLE IF NOT EXISTS baselines (
             period          TEXT NOT NULL,
@@ -127,6 +135,53 @@ def init_db(conn):
             computed_at     INTEGER,
             PRIMARY KEY (period, dimension, key)
         );
+
+        CREATE TABLE IF NOT EXISTS daily_summary (
+            day_ts          INTEGER NOT NULL,
+            src_addr        TEXT NOT NULL,
+            dst_is_private  INTEGER,
+            total_bytes     INTEGER,
+            total_packets   INTEGER,
+            flow_count      INTEGER,
+            unique_dsts     INTEGER,
+            unique_ports    INTEGER,
+            PRIMARY KEY (day_ts, src_addr, dst_is_private)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dsummary_day ON daily_summary (day_ts);
+
+        CREATE TABLE IF NOT EXISTS daily_dst_summary (
+            day_ts          INTEGER NOT NULL,
+            dst_addr        TEXT NOT NULL,
+            dst_country     TEXT,
+            dst_org         TEXT,
+            dst_is_private  INTEGER,
+            total_bytes     INTEGER,
+            flow_count      INTEGER,
+            unique_sources  INTEGER,
+            PRIMARY KEY (day_ts, dst_addr)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ddsummary_day ON daily_dst_summary (day_ts);
+
+        CREATE TABLE IF NOT EXISTS daily_port_summary (
+            day_ts          INTEGER NOT NULL,
+            dst_port        INTEGER NOT NULL,
+            proto           TEXT,
+            dst_is_private  INTEGER,
+            total_bytes     INTEGER,
+            flow_count      INTEGER,
+            unique_sources  INTEGER,
+            PRIMARY KEY (day_ts, dst_port, proto)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dpsummary_day ON daily_port_summary (day_ts);
+
+        CREATE TABLE IF NOT EXISTS daily_country_summary (
+            day_ts          INTEGER NOT NULL,
+            dst_country     TEXT NOT NULL,
+            total_bytes     INTEGER,
+            flow_count      INTEGER,
+            PRIMARY KEY (day_ts, dst_country)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dcsummary_day ON daily_country_summary (day_ts);
 
         CREATE TABLE IF NOT EXISTS known_destinations (
             dst_addr    TEXT PRIMARY KEY,
@@ -184,6 +239,57 @@ def _insert_baseline(conn, period, dimension, key, bytes_vals, flows_vals):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (period, dimension, key, avg_b, std_b, p95_b, avg_f, std_f,
           len(bytes_vals), int(time.time())))
+
+
+def rebuild_daily_summaries(conn):
+    log.info("Rebuilding daily summaries...")
+    cutoff = int(time.time()) - (35 * 86400)
+
+    conn.execute("DELETE FROM daily_summary WHERE day_ts < ?", (cutoff,))
+    conn.execute("""
+        INSERT OR REPLACE INTO daily_summary
+        SELECT (hour_ts / 86400) * 86400 AS day_ts,
+               src_addr, dst_is_private,
+               SUM(total_bytes), SUM(total_packets), SUM(flow_count),
+               COUNT(DISTINCT dst_addr), COUNT(DISTINCT dst_port)
+        FROM hourly_summary WHERE hour_ts >= ?
+        GROUP BY day_ts, src_addr, dst_is_private
+    """, (cutoff,))
+
+    conn.execute("DELETE FROM daily_dst_summary WHERE day_ts < ?", (cutoff,))
+    conn.execute("""
+        INSERT OR REPLACE INTO daily_dst_summary
+        SELECT (hour_ts / 86400) * 86400 AS day_ts,
+               dst_addr, dst_country, dst_org, dst_is_private,
+               SUM(total_bytes), SUM(flow_count),
+               COUNT(DISTINCT src_addr)
+        FROM hourly_summary WHERE hour_ts >= ?
+        GROUP BY day_ts, dst_addr
+    """, (cutoff,))
+
+    conn.execute("DELETE FROM daily_port_summary WHERE day_ts < ?", (cutoff,))
+    conn.execute("""
+        INSERT OR REPLACE INTO daily_port_summary
+        SELECT (hour_ts / 86400) * 86400 AS day_ts,
+               dst_port, proto, dst_is_private,
+               SUM(total_bytes), SUM(flow_count),
+               COUNT(DISTINCT src_addr)
+        FROM hourly_summary WHERE hour_ts >= ? AND dst_port IS NOT NULL
+        GROUP BY day_ts, dst_port, proto
+    """, (cutoff,))
+
+    conn.execute("DELETE FROM daily_country_summary WHERE day_ts < ?", (cutoff,))
+    conn.execute("""
+        INSERT OR REPLACE INTO daily_country_summary
+        SELECT (hour_ts / 86400) * 86400 AS day_ts,
+               dst_country,
+               SUM(total_bytes), SUM(flow_count)
+        FROM hourly_summary WHERE hour_ts >= ? AND dst_country IS NOT NULL AND dst_is_private = 0
+        GROUP BY day_ts, dst_country
+    """, (cutoff,))
+
+    conn.commit()
+    log.info("Daily summaries rebuilt")
 
 
 def rebuild_baselines(conn):
@@ -286,6 +392,7 @@ def summary_worker(db_path):
         try:
             conn = sqlite3.connect(db_path, timeout=30)
             rebuild_hourly_summary(conn)
+            rebuild_daily_summaries(conn)
             rebuild_baselines(conn)
             purge_old_flows(conn)
             conn.close()

@@ -209,7 +209,7 @@ docker compose ps
 4. Enter the OAuth client ID and secret from your `.env`
 5. Complete the OAuth authorization flow in the browser popup
 
-Once connected, Claude will have access to all 10 network analysis tools.
+Once connected, Claude will have access to all 12 network analysis tools.
 
 <!-- Screenshot: Claude.ai connector configuration -->
 <!-- Screenshot: OAuth authorization flow -->
@@ -217,34 +217,48 @@ Once connected, Claude will have access to all 10 network analysis tools.
 
 ---
 
-## The 10 MCP Tools
+## The 12 MCP Tools
 
-Each tool is designed for a specific analysis pattern. Claude chains them together automatically during investigations.
+Each tool is designed for a specific analysis pattern. Claude chains them together automatically during investigations. The tools are split into focused, fast queries — each completes in under 2 seconds even against millions of flows.
 
-### 1. Network Deep Dive (`get_network_deep_dive`)
+### 1. Traffic Overview (`get_traffic_overview`)
 
-The starting point for most analyses. Returns a comprehensive overview including top talkers, external destinations with GeoIP, protocol breakdown, anomaly candidates, rare ports, newly seen destinations, and off-hours activity.
+The starting point for most analyses. Returns total bytes, packets, flows, unique hosts, hourly volume timeline, top 20 talkers by bytes, and protocol/port breakdown. Queries pre-aggregated daily summary tables for near-instant results.
 
 **Try asking Claude:**
 > "Give me an overview of my network traffic for the last 7 days"
 
-### 2. Sample Flows (`get_sample_flows`)
+### 2. Top Destinations (`get_top_destinations`)
 
-Raw flow drill-down. Filter by source IP, destination IP, destination port, or protocol. Returns up to 500 individual flow records with timestamps, bytes, packets, and GeoIP data.
+Shows where traffic is going: top external destinations with GeoIP context, traffic by country, internal east-west traffic pairs, and newly seen destinations vs baseline.
+
+**Try asking Claude:**
+> "Where is my network traffic going? Show me the top destinations"
+
+### 3. Anomaly Scan (`get_anomaly_scan`)
+
+Security-focused scan for anomalies: hosts with unusually high destination counts, rare external ports, off-hours activity (midnight–5am UTC), and suspicious flow patterns. The flow pattern detector flags hosts with high flow counts but very low bytes-per-flow — a signature of port scanning, SYN sweeps, and slow-and-low reconnaissance that volume-based analysis misses.
+
+**Try asking Claude:**
+> "Scan my network for any security anomalies"
+
+### 4. Sample Flows (`get_sample_flows`)
+
+Raw flow drill-down. Filter by source IP, destination IP, destination port, or protocol. Returns up to 500 individual flow records with timestamps, bytes, packets, and GeoIP data. Capped at 48 hours.
 
 **Try asking Claude:**
 > "Show me the raw flows from 192.168.1.50 to port 443 in the last 24 hours"
 
-### 3. Host Profile (`get_host_profile`)
+### 5. Host Profile (`get_host_profile`)
 
-Complete behavioral profile for a single IP: all destinations contacted, ports used, countries reached, inbound connections, and hourly activity patterns.
+Complete behavioral profile for a single IP: all destinations contacted, ports used, countries reached, inbound connections, and hourly activity patterns. Capped at 7 days.
 
 **Try asking Claude:**
 > "Profile the behavior of 192.168.1.100 over the last week"
 
-### 4. Beaconing Detection (`detect_beaconing`)
+### 6. Beaconing Detection (`detect_beaconing`)
 
-Identifies potential C2 (command-and-control) beaconing by analyzing connection interval regularity. A host connecting to the same external destination at suspiciously regular intervals (low coefficient of variation) gets flagged.
+Identifies potential C2 (command-and-control) beaconing by analyzing connection interval regularity. Uses pre-aggregated summaries to find candidates, then checks raw timestamps for the top 30. Capped at 48 hours.
 
 The algorithm:
 1. Find all src→dst pairs with 6+ connections in the time window
@@ -255,42 +269,42 @@ The algorithm:
 **Try asking Claude:**
 > "Check for any C2 beaconing patterns in the last 24 hours"
 
-### 5. GeoIP Context (`get_geoip_context`)
+### 7. GeoIP Context (`get_geoip_context`)
 
 Everything known about an external IP from flow data: country, ASN organization, all internal hosts that communicated with it, total bytes transferred, ports used, and first/last seen timestamps.
 
 **Try asking Claude:**
 > "What do we know about IP 185.220.101.1?"
 
-### 6. Time Window Analysis (`get_time_window`)
+### 8. Time Window Analysis (`get_time_window`)
 
-Traffic summary for an exact Unix timestamp range. Useful for isolating a specific incident window — for example, the hour around a suspicious spike.
+Traffic summary for an exact timestamp range. Useful for isolating a specific incident window — for example, the hour around a suspicious spike. Capped at 48 hours.
 
 **Try asking Claude:**
 > "Show me all traffic between 2am and 3am last Tuesday"
 
-### 7. Baseline Delta (`get_baseline_delta`)
+### 9. Baseline Delta (`get_baseline_delta`)
 
-Compares the most recent N days against the equivalent prior period. Highlights hosts with significant traffic increases or decreases and identifies new hosts that appeared.
+Compares the most recent N days against the equivalent prior period. Highlights hosts with significant traffic increases or decreases and identifies new hosts that appeared. Capped at 7 days per period.
 
 **Try asking Claude:**
 > "Compare this week's traffic to last week"
 
-### 8. Baseline Profile (`get_baseline`)
+### 10. Baseline Profile (`get_baseline`)
 
 Returns the stored statistical baseline: daily average bytes, standard deviation, and 95th percentile for each dimension (network total, per-host, per-port, per-country) over 7, 14, or 30-day windows.
 
 **Try asking Claude:**
 > "What's the normal traffic baseline for the last 30 days?"
 
-### 9. Baseline Deviation Check (`check_baseline_deviation`)
+### 11. Baseline Deviation Check (`check_baseline_deviation`)
 
 The "is anything weird right now?" tool. Compares the last 24 hours against the stored baseline using z-scores. Returns severity ratings (normal / notable / anomalous) for each dimension, plus newly appeared and disappeared items.
 
 **Try asking Claude:**
 > "Is anything abnormal right now compared to baseline?"
 
-### 10. Collector Health (`get_collector_health`)
+### 12. Collector Health (`get_collector_health`)
 
 Operational check: total flows in the database, data retention range, flows received in the last 5 minutes, unique exporters, and database file size.
 
@@ -312,11 +326,11 @@ The real power shows when Claude chains multiple tools together in a single conv
 > **You:** "I noticed unusual traffic overnight. Can you investigate?"
 
 Claude will typically:
-1. Call `get_network_deep_dive` to get the broad picture
-2. Spot off-hours activity in the `off_hours_activity_0000_0500` section
-3. Call `get_host_profile` on the suspicious host
+1. Call `get_traffic_overview` for the broad picture
+2. Call `get_anomaly_scan` to flag suspicious patterns — including port scanning and reconnaissance via flow-to-byte ratio analysis
+3. Call `get_host_profile` on any flagged hosts
 4. Call `detect_beaconing` to check for C2 patterns
-5. Call `get_geoip_context` on any suspicious external IPs
+5. Call `get_geoip_context` on suspicious external IPs
 6. Provide a narrative summary with findings and recommendations
 
 ### Capacity Planning
@@ -335,7 +349,7 @@ Claude calls `get_geoip_context` to understand the external IP, then `get_sample
 
 > **You:** "Give me a daily network health summary"
 
-Claude checks `get_collector_health` to confirm the system is operational, runs `check_baseline_deviation` to surface anything abnormal, and summarizes the highlights from `get_network_deep_dive`.
+Claude checks `get_collector_health` to confirm the system is operational, runs `check_baseline_deviation` to surface anything abnormal, calls `get_traffic_overview` for a volume summary, and runs `get_anomaly_scan` to flag any security concerns.
 
 <!-- Screenshot: Full multi-tool investigation conversation -->
 
@@ -384,7 +398,8 @@ class GeoCache:
 ```
 
 A background thread runs hourly to:
-- Rebuild the `hourly_summary` aggregation table
+- Rebuild the `hourly_summary` aggregation table (per-flow-tuple, per-hour)
+- Rebuild `daily_summary` tables (per-host, per-destination, per-port, per-country) — these are the fast-query tier that most MCP tools use, reducing 50M+ raw flows to ~70k summary rows
 - Recompute statistical baselines (avg, stddev, p95 per dimension)
 - Purge raw flows older than 45 days
 
